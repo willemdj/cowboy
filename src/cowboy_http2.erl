@@ -145,7 +145,7 @@ before_loop(State, Buffer) ->
 	loop(State, Buffer).
 
 loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
-		children=Children, parse_state=PS}, Buffer) ->
+		children=Children, parse_state=PS, opts=Opts}, Buffer) ->
 	Transport:setopts(Socket, [{active, once}]),
 	{OK, Closed, Error} = Transport:messages(),
 	receive
@@ -192,10 +192,12 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 		Msg ->
 			error_logger:error_msg("Received stray message ~p.", [Msg]),
 			loop(State, Buffer)
-	%% @todo Configurable timeout.
-	after 60000 ->
+	after recv_timeout(Opts) ->
 		terminate(State, {internal_error, timeout, 'No message or data received before timeout.'})
 	end.
+
+recv_timeout(Opts) ->
+	maps:get(http2_recv_timeout, Opts, 60000).
 
 parse(State=#state{socket=Socket, transport=Transport, parse_state={preface, sequence, TRef}}, Data) ->
 	case Data of
@@ -416,6 +418,12 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
 	Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
 	commands(State#state{encode_state=EncodeState}, Stream#stream{local=nofin}, Tail);
+%% send trailers headers and finish the stream
+commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+		Stream=#stream{id=StreamID, local=nofin}, [{trailers, Headers}|Tail]) ->
+	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
+	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
+	commands(State#state{encode_state=EncodeState}, Stream#stream{local=fin}, Tail);
 %% @todo headers when local!=idle
 %% Send a response body chunk.
 %%
