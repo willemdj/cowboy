@@ -40,6 +40,9 @@
 -export([parse_header/3]).
 -export([parse_cookies/1]).
 -export([match_cookies/2]).
+-export([peercert/1]).
+-export([connection_information/1]).
+-export([negotiated_protocol/1]).
 
 %% Request body.
 -export([has_body/1]).
@@ -168,6 +171,36 @@ host_info(#{host_info := HostInfo}) ->
 -spec port(req()) -> inet:port_number().
 port(#{port := Port}) ->
 	Port.
+
+-spec peercert(req()) -> {ok, any()} | {error, any()}.
+peercert(#{pid := Pid}) ->
+	Pid ! {get_certificate, self()},
+	receive
+                Certificate ->
+                        Certificate
+	after 1000 ->
+		exit(timeout)
+	end.
+
+-spec connection_information(req()) -> {ok, any()} | {error, any()}.
+connection_information(#{pid := Pid}) ->
+	Pid ! {get_connection_information, self()},
+	receive
+                Response ->
+                        Response
+	after 1000 ->
+		exit(timeout)
+	end.
+
+-spec negotiated_protocol(req()) -> {ok, any()} | {error, any()}.
+negotiated_protocol(#{pid := Pid}) ->
+	Pid ! {get_negotiated_protocol, self()},
+	receive
+                Response ->
+                        Response
+	after 1000 ->
+		exit(timeout)
+	end.
 
 -spec path(req()) -> binary().
 path(#{path := Path}) ->
@@ -754,10 +787,8 @@ allowed_trailers_headers(_Trailers, _Req) -> false.
 -spec response_headers(Headers, req()) -> Headers when Headers::cowboy:http_headers().
 response_headers(Headers0, Req) ->
 	RespHeaders = maps:get(resp_headers, Req, #{}),
-	Headers = maps:merge(#{
-		<<"date">> => cowboy_clock:rfc1123(),
-		<<"server">> => <<"Cowboy">>
-	}, maps:merge(RespHeaders, Headers0)),
+        %% WdJ: removed headers for server and date here.
+	Headers = maps:merge(RespHeaders, Headers0),
 	%% The set-cookie header is special; we can only send one cookie per header.
 	%% We send the list of values for many cookies in one key of the map,
 	%% and let the protocols deal with it directly.

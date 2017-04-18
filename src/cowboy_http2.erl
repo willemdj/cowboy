@@ -169,6 +169,16 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 				_ ->
 					loop(State, Buffer)
 			end;
+                %% a hack...
+                {get_certificate, From} ->
+                        From ! ssl:peercert(Socket),
+			loop(State, Buffer);
+                {get_negotiated_protocol, From} ->
+                        From ! ssl:negotiated_protocol(Socket),
+			loop(State, Buffer);
+                {get_connection_information, From} ->
+                        From ! ssl:connection_information(Socket),
+			loop(State, Buffer);
 		%% Messages pertaining to a stream.
 		{{Pid, StreamID}, Msg} when Pid =:= self() ->
 			loop(info(State, StreamID, Msg), Buffer);
@@ -413,7 +423,8 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 %% @todo response when local!=idle
 %% Send response headers and initiate chunked encoding.
 commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID, local=idle}, [{headers, StatusCode, Headers0}|Tail]) ->
+		Stream=#stream{id=StreamID, local=L}, [{headers, StatusCode, Headers0}|Tail])
+    when L =:= idle; L =:= nofin ->
 	Headers = Headers0#{<<":status">> => status(StatusCode)},
 	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
 	Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
