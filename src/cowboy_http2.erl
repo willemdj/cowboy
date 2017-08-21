@@ -45,6 +45,7 @@
 	local_buffer = queue:new() :: queue:queue(
 		{cowboy_stream:fin(), non_neg_integer(), iolist()
 			| {sendfile, non_neg_integer(), pos_integer(), file:name_all()}}),
+        %% Number of queued message, so that we can do a simple check on empty queue
 	local_buffer_size = 0 :: non_neg_integer(),
 	%% Whether we finished receiving data.
 	remote = nofin :: cowboy_stream:fin(),
@@ -484,7 +485,7 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 				[{sendfile, fin, O, B, P}|Tail]);
 		_ ->
 			Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-			{State1, Stream1} = send_data(State, Stream#stream{local=nofin}, fin, Body),
+			{State1, Stream1} = send_data(State, Stream#stream{local=nofin}, fin, Body, false),
 			commands(State1#state{encode_state=EncodeState}, Stream1, Tail)
 	end;
 %% @todo response when local!=idle
@@ -497,11 +498,13 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 	Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
 	commands(State#state{encode_state=EncodeState}, Stream#stream{local=nofin}, Tail);
 %% send trailers headers and finish the stream
-commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID, local=nofin}, [{trailers, Headers}|Tail]) ->
+commands(State=#state{encode_state=EncodeState0},
+		Stream=#stream{local=nofin}, [{trailers, Headers}|Tail]) ->
 	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
-	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
-	commands(State#state{encode_state=EncodeState}, Stream#stream{local=fin}, Tail);
+        {State1, Stream1} = send_trailers(State#state{encode_state=EncodeState}, 
+                                          Stream, HeaderBlock),
+        commands(State1, Stream1, Tail);
+
 %% @todo headers when local!=idle
 %% Send a response body chunk.
 %%
@@ -515,7 +518,7 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 %% sure we only send as fast as the client can receive and don't block
 %% anything.
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
-	{State, Stream} = send_data(State0, Stream0, IsFin, Data),
+	{State, Stream} = send_data(State0, Stream0, IsFin, Data, false),
 	commands(State, Stream, Tail);
 
 %% @todo data when local!=nofin
@@ -533,7 +536,7 @@ commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 %% implementation necessarily varies between HTTP/1.1 and HTTP/2.
 commands(State0, Stream0=#stream{local=nofin},
 		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
-	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
+	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}, false),
 	commands(State, Stream, Tail);
 %% @todo sendfile when local!=nofin
 %% Send a push promise.
@@ -638,20 +641,26 @@ send_data(State=#state{local_window=ConnWindow},
 	{State, Stream};
 send_data(State0, Stream0=#stream{local_buffer=Q0, local_buffer_size=BufferSize}) ->
 	%% We know there is an item in the queue.
-	{{value, {IsFin, DataSize, Data}}, Q} = queue:out(Q0),
-	{State, Stream} = send_data(State0,
-		Stream0#stream{local_buffer=Q, local_buffer_size=BufferSize - DataSize},
-		IsFin, Data),
-	send_data(State, Stream).
+        case queue:out(Q0) of
+                 {{value, {trailers, Data}}, Q} ->
+                         send_trailers(State0, Stream0#stream{local_buffer=Q}, Data);
+                 {{value, {IsFin, _DataSize, Data}}, Q} ->
+	                 {State, Stream} = send_data(State0,
+		                 Stream0#stream{local_buffer=Q,
+                                                local_buffer_size=BufferSize - 1},
+		                 IsFin, Data, true),
+	                 send_data(State, Stream)
+        end.
+
 
 %% Send data immediately if we can, buffer otherwise.
 %% @todo We might want to print an error if local=fin.
 send_data(State=#state{local_window=ConnWindow},
-		Stream=#stream{local_window=StreamWindow}, IsFin, Data)
+		Stream=#stream{local_window=StreamWindow}, IsFin, Data, IsRetry)
 		when ConnWindow =< 0; StreamWindow =< 0 ->
-	{State, queue_data(Stream, IsFin, Data)};
+	{State, queue_data(Stream, IsFin, Data, IsRetry)};
 send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWindow},
-		Stream=#stream{id=StreamID, local_window=StreamWindow}, IsFin, Data) ->
+		Stream=#stream{id=StreamID, local_window=StreamWindow}, IsFin, Data, IsRetry) ->
 	MaxFrameSize = 16384, %% @todo Use the real SETTINGS_MAX_FRAME_SIZE set by the client.
 	MaxSendSize = min(min(ConnWindow, StreamWindow), MaxFrameSize),
 	case Data of
@@ -665,7 +674,7 @@ send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWind
 			Transport:sendfile(Socket, Path, Offset, MaxSendSize),
 			send_data(State#state{local_window=ConnWindow - MaxSendSize},
 				Stream#stream{local_window=StreamWindow - MaxSendSize},
-				IsFin, {sendfile, Offset + MaxSendSize, Bytes - MaxSendSize, Path});
+				IsFin, {sendfile, Offset + MaxSendSize, Bytes - MaxSendSize, Path}, IsRetry);
 		Iolist0 ->
 			IolistSize = iolist_size(Iolist0),
 			if
@@ -678,17 +687,38 @@ send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWind
 					Transport:send(Socket, cow_http2:data(StreamID, nofin, Iolist)),
 					send_data(State#state{local_window=ConnWindow - MaxSendSize},
 						Stream#stream{local_window=StreamWindow - MaxSendSize},
-						IsFin, More)
+						IsFin, More, IsRetry)
 			end
 	end.
 
-queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data) ->
+%% Don't send the trailers if there is something in the queue.
+send_trailers(State=#state{socket=Socket, transport=Transport},
+              Stream=#stream{id=StreamID, local_buffer=Q}, HeaderBlock) ->
+        case queue:is_empty(Q) of
+                false ->
+                        {State, queue_trailers(Stream, HeaderBlock)};
+                true ->
+	                Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
+                        {State, Stream#stream{local=fin}}
+        end.
+
+queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data, IsRetry) ->
 	DataSize = case Data of
 		{sendfile, _, Bytes, _} -> Bytes;
 		Iolist -> iolist_size(Iolist)
 	end,
-	Q = queue:in({IsFin, DataSize, Data}, Q0),
-	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + DataSize}.
+	Q = case IsRetry of
+              true ->
+                %% Make sure that the order is not changed
+                queue:in_r({IsFin, DataSize, Data}, Q0);
+              false -> 
+                queue:in({IsFin, DataSize, Data}, Q0)
+            end,
+	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + 1}.
+
+queue_trailers(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, Data) ->
+	Q = queue:in({trailers, Data}, Q0),
+	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + 1}.
 
 -spec terminate(#state{}, _) -> no_return().
 terminate(undefined, Reason) ->
