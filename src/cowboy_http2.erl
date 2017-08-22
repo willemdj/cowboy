@@ -103,7 +103,7 @@
 
 	%% Streams can spawn zero or more children which are then managed
 	%% by this module if operating as a supervisor.
-	children = [] :: [{pid(), cowboy_stream:streamid()}],
+	children = cowboy_children:init() :: cowboy_children:children(),
 
 	%% The client starts by sending a sequence of bytes as a preface,
 	%% followed by a potentially empty SETTINGS frame. Then the connection
@@ -195,6 +195,10 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 			exit(Reason);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [], {State, Buffer});
+		%% Timeouts.
+		{timeout, Ref, {shutdown, Pid}} ->
+			cowboy_children:shutdown_timeout(Children, Ref, Pid),
+			loop(State, Buffer);
 		{timeout, TRef, preface_timeout} ->
 			case PS of
 				{preface, _, TRef} ->
@@ -221,14 +225,10 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 			loop(down(State, Pid, Msg), Buffer);
 		%% Calls from supervisor module.
 		{'$gen_call', {From, Tag}, which_children} ->
-			Workers = [{?MODULE, Pid, worker, [?MODULE]} || {Pid, _} <- Children],
-			From ! {Tag, Workers},
+			From ! {Tag, cowboy_children:which_children(Children, ?MODULE)},
 			loop(State, Buffer);
 		{'$gen_call', {From, Tag}, count_children} ->
-			NbChildren = length(Children),
-			Counts = [{specs, 1}, {active, NbChildren},
-				{supervisors, 0}, {workers, NbChildren}],
-			From ! {Tag, Counts},
+			From ! {Tag, cowboy_children:count_children(Children)},
 			loop(State, Buffer);
 		{'$gen_call', {From, Tag}, _} ->
 			From ! {Tag, {error, ?MODULE}},
@@ -433,11 +433,16 @@ continuation_frame(State, _) ->
 		'An invalid frame was received while expecting a CONTINUATION frame. (RFC7540 6.2)'}).
 
 down(State=#state{children=Children0}, Pid, Msg) ->
-	case lists:keytake(Pid, 1, Children0) of
-		{value, {_, StreamID}, Children} ->
+	case cowboy_children:down(Children0, Pid) of
+		%% The stream was terminated already.
+		{ok, undefined, Children} ->
+			State#state{children=Children};
+		%% The stream is still running.
+		{ok, StreamID, Children} ->
 			info(State#state{children=Children}, StreamID, Msg);
-		false ->
-			error_logger:error_msg("Received EXIT signal ~p for unknown process ~p.", [Msg, Pid]),
+		%% The process was unknown.
+		error ->
+			error_logger:error_msg("Received EXIT signal ~p for unknown process ~p.~n", [Msg, Pid]),
 			State
 	end.
 
@@ -485,7 +490,7 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 				[{sendfile, fin, O, B, P}|Tail]);
 		_ ->
 			Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-			{State1, Stream1} = send_data(State, Stream#stream{local=nofin}, fin, Body, false),
+			{State1, Stream1} = send_data(State, Stream#stream{local=nofin}, fin, Body),
 			commands(State1#state{encode_state=EncodeState}, Stream1, Tail)
 	end;
 %% @todo response when local!=idle
@@ -518,7 +523,7 @@ commands(State=#state{encode_state=EncodeState0},
 %% sure we only send as fast as the client can receive and don't block
 %% anything.
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
-	{State, Stream} = send_data(State0, Stream0, IsFin, Data, false),
+	{State, Stream} = send_data(State0, Stream0, IsFin, Data),
 	commands(State, Stream, Tail);
 
 %% @todo data when local!=nofin
@@ -536,7 +541,7 @@ commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 %% implementation necessarily varies between HTTP/1.1 and HTTP/2.
 commands(State0, Stream0=#stream{local=nofin},
 		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
-	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}, false),
+	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
 	commands(State, Stream, Tail);
 %% @todo sendfile when local!=nofin
 %% Send a push promise.
@@ -579,8 +584,9 @@ commands(State=#state{socket=Socket, transport=Transport, remote_window=ConnWind
 		Stream#stream{remote_window=StreamWindow + Size}, Tail);
 %% Supervise a child process.
 commands(State=#state{children=Children}, Stream=#stream{id=StreamID},
-		[{spawn, Pid, _Shutdown}|Tail]) -> %% @todo Shutdown
-	 commands(State#state{children=[{Pid, StreamID}|Children]}, Stream, Tail);
+		[{spawn, Pid, Shutdown}|Tail]) ->
+	 commands(State#state{children=cowboy_children:up(Children, Pid, StreamID, Shutdown)},
+		Stream, Tail);
 %% Error handling.
 commands(State, Stream=#stream{id=StreamID}, [Error = {internal_error, _, _}|_Tail]) ->
 	%% @todo Do we want to run the commands after an internal_error?
@@ -643,24 +649,29 @@ send_data(State0, Stream0=#stream{local_buffer=Q0, local_buffer_size=BufferSize}
 	%% We know there is an item in the queue.
         case queue:out(Q0) of
                  {{value, {trailers, Data}}, Q} ->
-                         send_trailers(State0, Stream0#stream{local_buffer=Q}, Data);
+                         send_trailers(State0, 
+                                       Stream0#stream{local_buffer=Q,
+                                                      local_buffer_size=BufferSize - 1},
+                                       Data);
                  {{value, {IsFin, _DataSize, Data}}, Q} ->
 	                 {State, Stream} = send_data(State0,
 		                 Stream0#stream{local_buffer=Q,
                                                 local_buffer_size=BufferSize - 1},
-		                 IsFin, Data, true),
+		                 IsFin, Data, in_r),
 	                 send_data(State, Stream)
         end.
 
+send_data(State, Stream, IsFin, Data) ->
+	send_data(State, Stream, IsFin, Data, in).
 
 %% Send data immediately if we can, buffer otherwise.
 %% @todo We might want to print an error if local=fin.
 send_data(State=#state{local_window=ConnWindow},
-		Stream=#stream{local_window=StreamWindow}, IsFin, Data, IsRetry)
+		Stream=#stream{local_window=StreamWindow}, IsFin, Data, In)
 		when ConnWindow =< 0; StreamWindow =< 0 ->
-	{State, queue_data(Stream, IsFin, Data, IsRetry)};
+	{State, queue_data(Stream, IsFin, Data, In)};
 send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWindow},
-		Stream=#stream{id=StreamID, local_window=StreamWindow}, IsFin, Data, IsRetry) ->
+		Stream=#stream{id=StreamID, local_window=StreamWindow}, IsFin, Data, In) ->
 	MaxFrameSize = 16384, %% @todo Use the real SETTINGS_MAX_FRAME_SIZE set by the client.
 	MaxSendSize = min(min(ConnWindow, StreamWindow), MaxFrameSize),
 	case Data of
@@ -674,7 +685,7 @@ send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWind
 			Transport:sendfile(Socket, Path, Offset, MaxSendSize),
 			send_data(State#state{local_window=ConnWindow - MaxSendSize},
 				Stream#stream{local_window=StreamWindow - MaxSendSize},
-				IsFin, {sendfile, Offset + MaxSendSize, Bytes - MaxSendSize, Path}, IsRetry);
+				IsFin, {sendfile, Offset + MaxSendSize, Bytes - MaxSendSize, Path}, In);
 		Iolist0 ->
 			IolistSize = iolist_size(Iolist0),
 			if
@@ -687,7 +698,7 @@ send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWind
 					Transport:send(Socket, cow_http2:data(StreamID, nofin, Iolist)),
 					send_data(State#state{local_window=ConnWindow - MaxSendSize},
 						Stream#stream{local_window=StreamWindow - MaxSendSize},
-						IsFin, More, IsRetry)
+						IsFin, More, In)
 			end
 	end.
 
@@ -702,18 +713,12 @@ send_trailers(State=#state{socket=Socket, transport=Transport},
                         {State, Stream#stream{local=fin}}
         end.
 
-queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data, IsRetry) ->
+queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data, In) ->
 	DataSize = case Data of
 		{sendfile, _, Bytes, _} -> Bytes;
 		Iolist -> iolist_size(Iolist)
 	end,
-	Q = case IsRetry of
-              true ->
-                %% Make sure that the order is not changed
-                queue:in_r({IsFin, DataSize, Data}, Q0);
-              false -> 
-                queue:in({IsFin, DataSize, Data}, Q0)
-            end,
+	Q = queue:In({trailers, Data}, Q0),
 	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + 1}.
 
 queue_trailers(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, Data) ->
@@ -728,7 +733,8 @@ terminate(#state{socket=Socket, transport=Transport, client_streamid=LastStreamI
 	%% @todo We might want to optionally send the Reason value
 	%% as debug data in the GOAWAY frame here. Perhaps more.
 	Transport:send(Socket, cow_http2:goaway(LastStreamID, terminate_reason(Reason), <<>>)),
-	terminate_all_streams(Streams, Reason, Children),
+	terminate_all_streams(Streams, Reason),
+	cowboy_children:terminate(Children),
 	Transport:close(Socket),
 	exit({shutdown, Reason}).
 
@@ -737,15 +743,14 @@ terminate_reason({stop, _, _}) -> no_error;
 terminate_reason({socket_error, _, _}) -> internal_error;
 terminate_reason({internal_error, _, _}) -> internal_error.
 
-terminate_all_streams([], _, []) ->
+terminate_all_streams([], _) ->
 	ok;
 %% This stream was already terminated and is now just flushing the data out. Skip it.
-terminate_all_streams([#stream{state=flush}|Tail], Reason, Children) ->
-	terminate_all_streams(Tail, Reason, Children);
-terminate_all_streams([#stream{id=StreamID, state=StreamState}|Tail], Reason, Children0) ->
+terminate_all_streams([#stream{state=flush}|Tail], Reason) ->
+	terminate_all_streams(Tail, Reason);
+terminate_all_streams([#stream{id=StreamID, state=StreamState}|Tail], Reason) ->
 	stream_call_terminate(StreamID, Reason, StreamState),
-	Children = stream_terminate_children(Children0, StreamID, []),
-	terminate_all_streams(Tail, Reason, Children).
+	terminate_all_streams(Tail, Reason).
 
 %% Stream functions.
 
@@ -840,26 +845,26 @@ stream_terminate(State=#state{socket=Socket, transport=Transport,
 		{value, #stream{state=StreamState, local=idle}, Streams} when Reason =:= normal ->
 			State1 = info(State, StreamID, {response, 204, #{}, <<>>}),
 			stream_call_terminate(StreamID, Reason, StreamState),
-			Children = stream_terminate_children(Children0, StreamID, []),
+			Children = cowboy_children:shutdown(Children0, StreamID),
 			State1#state{streams=Streams, children=Children};
 		%% When a response was sent but not terminated, we need to close the stream.
 		{value, #stream{state=StreamState, local=nofin, local_buffer_size=0}, Streams}
 				when Reason =:= normal ->
 			Transport:send(Socket, cow_http2:data(StreamID, fin, <<>>)),
 			stream_call_terminate(StreamID, Reason, StreamState),
-			Children = stream_terminate_children(Children0, StreamID, []),
+			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=Streams, children=Children};
 		%% Unless there is still data in the buffer. We can however reset
 		%% a few fields and set a special local state to avoid confusion.
 		{value, Stream=#stream{state=StreamState, local=nofin}, Streams} ->
 			stream_call_terminate(StreamID, Reason, StreamState),
-			Children = stream_terminate_children(Children0, StreamID, []),
+			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=[Stream#stream{state=flush, local=flush}|Streams],
 				children=Children};
 		%% Otherwise we sent an RST_STREAM and/or the stream is already closed.
 		{value, #stream{state=StreamState}, Streams} ->
 			stream_call_terminate(StreamID, Reason, StreamState),
-			Children = stream_terminate_children(Children0, StreamID, []),
+			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=Streams, children=Children};
 		false ->
 			%% @todo Unknown stream. Not sure what to do here. Check again once all
@@ -875,17 +880,6 @@ stream_call_terminate(StreamID, Reason, StreamState) ->
 			"cowboy_stream:terminate(~p, ~p, ~p) with reason ~p:~p.",
 			[StreamID, Reason, StreamState, Class, Reason])
 	end.
-
-stream_terminate_children([], _, Acc) ->
-	Acc;
-stream_terminate_children([{Pid, StreamID}|Tail], StreamID, Acc) ->
-	%% We unlink and flush the mailbox to avoid receiving a stray message.
-	unlink(Pid),
-	receive {'EXIT', Pid, _} -> ok after 0 -> ok end,
-	exit(Pid, kill),
-	stream_terminate_children(Tail, StreamID, Acc);
-stream_terminate_children([Child|Tail], StreamID, Acc) ->
-	stream_terminate_children(Tail, StreamID, [Child|Acc]).
 
 %% Headers encode/decode.
 
@@ -921,9 +915,9 @@ headers_encode(Headers0, EncodeState) ->
 system_continue(_, _, {State, Buffer}) ->
 	loop(State, Buffer).
 
--spec system_terminate(any(), _, _, _) -> no_return().
-system_terminate(Reason, _, _, _) ->
-	exit(Reason).
+-spec system_terminate(any(), _, _, {#state{}, binary()}) -> no_return().
+system_terminate(Reason, _, _, {State, _}) ->
+	terminate(State, Reason).
 
 -spec system_code_change(Misc, _, _, _) -> {ok, Misc} when Misc::{#state{}, binary()}.
 system_code_change(Misc, _, _, _) ->
