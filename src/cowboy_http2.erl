@@ -718,7 +718,7 @@ queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data
 		{sendfile, _, Bytes, _} -> Bytes;
 		Iolist -> iolist_size(Iolist)
 	end,
-	Q = queue:In({trailers, Data}, Q0),
+	Q = queue:In({IsFin, DataSize, Data}, Q0),
 	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + 1}.
 
 queue_trailers(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, Data) ->
